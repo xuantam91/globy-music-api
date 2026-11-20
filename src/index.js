@@ -29,7 +29,7 @@ function createZingSig(path, params) {
   const sorted = {};
   Object.keys(params).sort().forEach(k => { sorted[k] = params[k]; });
 
-  const filtered = [];
+  const filtered = {};
   for (const k in sorted) {
     if (SIGNED_KEYS.includes(k) && sorted[k] !== null && sorted[k] !== undefined && sorted[k] !== "") {
       filtered[k] = sorted[k];
@@ -54,9 +54,12 @@ async function getZingCookie() {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
     });
-    const setCookie = res.headers.get("set-cookie") || "";
-    if (setCookie) {
-      cachedZingCookie = setCookie.split(";")[0];
+    
+    // Thu thập toàn bộ cookie (đặc biệt là zmp3_rqid bắt buộc)
+    const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")];
+    const cookieStr = setCookies.filter(Boolean).map(c => c.split(";")[0]).join("; ");
+    if (cookieStr) {
+      cachedZingCookie = cookieStr;
       zingCookieTimestamp = now;
     }
     return cachedZingCookie;
@@ -96,9 +99,9 @@ async function searchZingSong(query) {
     if (data.err === 0 && data.data?.songs?.length > 0) {
       const s = data.data.songs[0];
       return {
-        id: s.encodeId,
+        id: s.encodeId, // ID ngắn 12 ký tự an toàn cho buffer ESP32
         title: s.title || query,
-        artist: s.artistsNames || (s.artists && s.artists[0]?.name) || "Nhiều ca sĩ",
+        artist: s.artistsNames || (s.artists && s.artists[0]?.name) || "Zing Artist",
         thumbnail: s.thumbnailM || s.thumbnail || "",
         duration: s.duration || 0,
         source: "zing",
@@ -127,10 +130,11 @@ async function getZingAudioUrl(songId) {
 }
 
 // ============================================================
-// 2. SOUNDCLOUD ENGINE (Kho nhạc Remix, Cover, Nonstop, Quốc tế)
+// 2. SOUNDCLOUD ENGINE (Chỉ lấy Progressive MP3 để tránh crash ESP32)
 // ============================================================
 let cachedSCClientId = "Me902VCqB1VmYOCc7W9v0XM17WgIHGSL";
 let scClientTimestamp = 0;
+const scTranscodingCache = new Map();
 
 async function getSoundCloudClientId() {
   const now = Date.now();
@@ -156,23 +160,26 @@ async function getSoundCloudClientId() {
 async function searchSoundCloud(query) {
   try {
     const clientId = await getSoundCloudClientId();
-    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=3`;
+    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=5`;
     const res = await fetch(searchUrl, {
       headers: { "User-Agent": "Mozilla/5.0" },
     });
     if (!res.ok) return null;
 
     const data = await res.json();
-    const track = data.collection?.[0];
-    if (track) {
-      // Ưu tiên progressive (MP3) trước, nếu không có thì lấy HLS (AAC)
-      const trans =
-        track.media?.transcodings?.find(t => t.format?.protocol === "progressive") ||
-        track.media?.transcodings?.[0];
+    for (const track of data.collection || []) {
+      // QUAN TRỌNG: XiaoZhi ESP32 chỉ decode được MP3 thuần (progressive)
+      // KHÔNG ĐƯỢC trả về HLS (m3u8) vì decoder ESP32 sẽ bị tràn stack (assert crash)
+      const trans = track.media?.transcodings?.find(
+        t => t.format?.protocol === "progressive" || t.format?.mime_type?.includes("mpeg")
+      );
 
       if (trans) {
+        const trackIdStr = String(track.id);
+        scTranscodingCache.set(trackIdStr, trans.url);
+
         return {
-          id: encodeURIComponent(trans.url),
+          id: trackIdStr, // Dùng ID ngắn (chữ số) để tránh tràn URL buffer của ESP32
           title: track.title,
           artist: track.user?.username || "SoundCloud Artist",
           thumbnail: track.artwork_url || track.user?.avatar_url || "",
@@ -187,16 +194,33 @@ async function searchSoundCloud(query) {
   return null;
 }
 
-async function getSoundCloudAudioUrl(transcodingUrl) {
+async function getSoundCloudAudioUrl(trackId) {
   try {
     const clientId = await getSoundCloudClientId();
-    const targetUrl = `${decodeURIComponent(transcodingUrl)}?client_id=${clientId}`;
-    const res = await fetch(targetUrl, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      return data.url;
+    let transUrl = scTranscodingCache.get(String(trackId));
+
+    if (!transUrl) {
+      // Nếu chưa có trong cache thì tra cứu lại track
+      const trackRes = await fetch(`https://api-v2.soundcloud.com/tracks/${trackId}?client_id=${clientId}`, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      if (trackRes.ok) {
+        const track = await trackRes.json();
+        const trans = track.media?.transcodings?.find(
+          t => t.format?.protocol === "progressive" || t.format?.mime_type?.includes("mpeg")
+        );
+        if (trans) transUrl = trans.url;
+      }
+    }
+
+    if (transUrl) {
+      const res = await fetch(`${transUrl}?client_id=${clientId}`, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return data.url;
+      }
     }
   } catch (err) {
     console.error("SoundCloud audio error:", err);
@@ -279,12 +303,19 @@ function matchRadio(query) {
 }
 
 // ============================================================
-// 4. API CHO ESP32 (TẬP TRUNG ÂM THANH - KHÔNG CẦN LYRIC)
+// 4. API CHO ESP32 (TẬP TRUNG MP3 THUẦN - AN TOÀN BUFFER)
 // ============================================================
 
-// 4.1) /stream_pcm?song=... (Tìm kiếm đa nguồn thông minh)
+// 4.1) /stream_pcm?song=... (Hỗ trợ cả param artist của XiaoZhi)
 app.get("/stream_pcm", async (c) => {
-  let q = (c.req.query("song") || "").trim();
+  let song = (c.req.query("song") || "").trim();
+  const artist = (c.req.query("artist") || "").trim();
+
+  let q = song;
+  if (artist && !song.toLowerCase().includes(artist.toLowerCase())) {
+    q = `${song} ${artist}`.trim();
+  }
+
   if (!q) {
     return c.json({ error: "Missing song query" }, 400);
   }
@@ -302,9 +333,7 @@ app.get("/stream_pcm", async (c) => {
     });
   }
 
-  // 2. Kiểm tra chỉ định tiền tố nguồn:
-  // "sc:tên_bài" -> ép SoundCloud
-  // "zing:tên_bài" -> ép Zing
+  // 2. Kiểm tra chỉ định tiền tố:
   let forcedSource = "";
   if (q.toLowerCase().startsWith("sc:") || q.toLowerCase().startsWith("soundcloud:")) {
     forcedSource = "soundcloud";
@@ -314,22 +343,15 @@ app.get("/stream_pcm", async (c) => {
     q = q.replace(/^zing:/i, "").trim();
   }
 
-  // 3. Nhận diện từ khóa remix, cover, dj, lofi -> Ưu tiên SoundCloud
-  const isRemixOrCover = /remix|cover|lofi|nonstop|dj|mashup|slowed|bassboost|vinahouse/i.test(q);
-
   let songResult = null;
 
-  if (forcedSource === "soundcloud" || (isRemixOrCover && forcedSource !== "zing")) {
-    // Thử SoundCloud trước cho nhạc remix/cover
+  // Nhận diện bài hát: Zing MP3 luôn là ưu tiên hàng đầu vì có link MP3 128kbps chuẩn
+  if (forcedSource === "soundcloud") {
     songResult = await searchSoundCloud(q);
-    if (!songResult && forcedSource !== "soundcloud") {
-      songResult = await searchZingSong(q);
-    }
-  } else if (forcedSource === "zing") {
-    songResult = await searchZingSong(q);
   } else {
-    // Mặc định: Zing MP3 trước -> nếu không thấy thì tự động sang SoundCloud
+    // 1) Tìm kiếm trên Zing MP3 trước (Zing trả về chuẩn file MP3 audio/mpeg 100%)
     songResult = await searchZingSong(q);
+    // 2) Nếu Zing MP3 không có bài -> Fallback sang SoundCloud (chỉ lấy track có Progressive MP3)
     if (!songResult) {
       songResult = await searchSoundCloud(q);
     }
@@ -339,6 +361,7 @@ app.get("/stream_pcm", async (c) => {
     return c.json({
       title: songResult.title,
       artist: songResult.artist,
+      // URL ngắn gọn, chỉ truyền id ngắn (không quá 15 ký tự) tránh tràn buffer ESP32
       audio_url: `/proxy_audio?id=${songResult.id}&source=${songResult.source}`,
       thumbnail: songResult.thumbnail,
       duration: songResult.duration,
@@ -350,11 +373,10 @@ app.get("/stream_pcm", async (c) => {
 });
 
 // 4.2) /proxy_audio?id=...&source=...
-// Trả về HTTP 302 chuyển hướng trực tiếp đến CDN máy chủ nhanh nhất
+// Chuyển hướng trực tiếp 302 sang file MP3 CDN
 app.get("/proxy_audio", async (c) => {
   const id = c.req.query("id");
   const source = c.req.query("source") || "zing";
-  const mode = c.req.query("mode");
 
   if (!id) return c.text("Missing id", 400);
 
@@ -371,22 +393,12 @@ app.get("/proxy_audio", async (c) => {
 
   if (!directUrl) return c.text("Audio stream not found", 404);
 
-  // Mặc định 302 Redirect (0s delay, không tốn ram/cpu của worker)
-  if (mode !== "stream") {
-    return c.redirect(directUrl, 302);
-  }
-
-  // Stream proxy nếu cần
-  const streamRes = await fetch(directUrl);
-  return new Response(streamRes.body, {
-    headers: {
-      "Content-Type": streamRes.headers.get("content-type") || "audio/mpeg",
-      "Cache-Control": "no-cache",
-    },
-  });
+  // Trả về HTTP 302 Found tới file MP3 trực tiếp
+  c.header("Content-Type", "audio/mpeg");
+  return c.redirect(directUrl, 302);
 });
 
-// Aliases cho firmware ESP32 cũ
+// Aliases
 app.get("/audio/:id", (c) => {
   const id = c.req.param("id");
   const source = c.req.query("source") || "zing";
@@ -398,7 +410,7 @@ app.get("/radio/play", (c) => {
   return c.redirect(`/proxy_audio?id=${encodeURIComponent(id)}&source=radio`, 302);
 });
 
-// Endpoint lyric giữ lại trả rỗng để firmware cũ không bị crash nếu có gọi
+// Endpoint lyric trả rỗng để tương thích firmware
 app.get(["/proxy_lyric", "/dynamic_lyric"], (c) => c.text(""));
 
 // Healthcheck
@@ -406,14 +418,14 @@ app.get("/api/health", (c) => {
   return c.json({
     status: "ok",
     platform: "Cloudflare Workers (Edge)",
-    engine: "Multi-Source Audio Engine (Zing + SoundCloud + Radio)",
+    engine: "Globy Music Engine v2.1 (MP3 Pure for ESP32 XiaoZhi)",
     sources: ["zing", "soundcloud", "radio"],
     timestamp: new Date().toISOString(),
   });
 });
 
 // ============================================================
-// 5. GIAO DIỆN WEB PLAYGROUND TRỰC QUAN (KHÔNG CẦN LYRIC)
+// 5. GIAO DIỆN WEB PLAYGROUND
 // ============================================================
 app.get("/", (c) => {
   const html = `<!DOCTYPE html>
@@ -421,7 +433,7 @@ app.get("/", (c) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Multi-Source Music API - Cloudflare Edge</title>
+  <title>Globy XiaoZhi Music Engine (Edge MP3)</title>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
   <style>
     :root { --bg: #090d16; --card: rgba(22, 30, 49, 0.85); --primary: #38bdf8; --zing: #8b5cf6; --sc: #f97316; --radio: #10b981; --text: #f8fafc; --muted: #94a3b8; }
@@ -456,26 +468,25 @@ app.get("/", (c) => {
 <div class="container">
   <header>
     <div class="badge-bar">
-      <span class="badge badge-zing">Zing MP3</span>
-      <span class="badge badge-sc">SoundCloud Remix</span>
+      <span class="badge badge-zing">Zing MP3 (Pure 128k)</span>
+      <span class="badge badge-sc">SoundCloud MP3</span>
       <span class="badge badge-radio">Radio VOV</span>
     </div>
-    <h1>Multi-Source Music Engine</h1>
-    <p class="sub">Kho nhạc khổng lồ đa nguồn - Tối ưu siêu tốc cho ESP32</p>
+    <h1>Globy & XiaoZhi Music Engine</h1>
+    <p class="sub">Tối ưu 100% định dạng MP3 cho ESP32 XiaoZhi AudioStreamPlayer</p>
   </header>
 
   <div class="card">
     <div class="search-row">
-      <input type="text" id="songInput" placeholder="Nhập tên bài hát (VD: Cắt đôi nỗi sầu remix, See tình, Lofi...)">
+      <input type="text" id="songInput" placeholder="Nhập tên bài hát (VD: ABC song, Top hits, Cắt đôi nỗi sầu...)">
       <button class="btn-search" onclick="search()">Tìm & Phát</button>
     </div>
     <div class="chips">
       <span style="font-size: 13px; color: var(--muted);">Thử nhanh:</span>
-      <span class="chip" onclick="quick('Cắt đôi nỗi sầu')">Cắt đôi nỗi sầu (Zing)</span>
-      <span class="chip" onclick="quick('Cắt đôi nỗi sầu remix')">Cắt đôi nỗi sầu (Remix SC)</span>
-      <span class="chip" onclick="quick('sc:Sơn Tùng MTP')">Sơn Tùng (SoundCloud)</span>
-      <span class="chip" onclick="quick('vov1')">VOV1 Thời sự</span>
-      <span class="chip" onclick="quick('vov-gt')">VOV Giao thông</span>
+      <span class="chip" onclick="quick('ABC song')">ABC song</span>
+      <span class="chip" onclick="quick('top hits')">Top hits</span>
+      <span class="chip" onclick="quick('Cắt đôi nỗi sầu')">Cắt đôi nỗi sầu</span>
+      <span class="chip" onclick="quick('vov1')">VOV1</span>
     </div>
   </div>
 
@@ -491,7 +502,7 @@ app.get("/", (c) => {
       </div>
     </div>
     <audio id="player" controls autoplay></audio>
-    <p style="font-size: 13px; font-weight: 700; margin-bottom: 6px;">JSON trả về cho ESP32 (Không cần lyric):</p>
+    <p style="font-size: 13px; font-weight: 700; margin-bottom: 6px;">JSON trả về cho ESP32:</p>
     <pre id="json"></pre>
   </div>
 </div>
