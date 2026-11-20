@@ -386,7 +386,8 @@ app.get("/stream_pcm", async (c) => {
 });
 
 // 4.2) /proxy_audio?id=...&source=...
-// Chuyển hướng trực tiếp 302 sang file MP3 CDN
+// STREAM TRỰC TIẾP LUỒNG MP3 (HTTP 200/206) VỀ ESP32
+// KHÔNG dùng 302 redirect vì HttpClient trên ESP32 XiaoZhi không hỗ trợ follow redirect
 app.get("/proxy_audio", async (c) => {
   const id = c.req.query("id");
   const source = c.req.query("source") || "zing";
@@ -406,9 +407,34 @@ app.get("/proxy_audio", async (c) => {
 
   if (!directUrl) return c.text("Audio stream not found", 404);
 
-  // Trả về HTTP 302 Found tới file MP3 trực tiếp
-  c.header("Content-Type", "audio/mpeg");
-  return c.redirect(directUrl, 302);
+  // Pipe luồng âm thanh trực tiếp từ CDN về thiết bị
+  const rangeHeader = c.req.header("range");
+  const fetchHeaders = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    Referer: "https://zingmp3.vn/",
+  };
+  if (rangeHeader) {
+    fetchHeaders["Range"] = rangeHeader;
+  }
+
+  const audioRes = await fetch(directUrl, { headers: fetchHeaders });
+  
+  const responseHeaders = new Headers();
+  responseHeaders.set("Content-Type", "audio/mpeg");
+  responseHeaders.set("Accept-Ranges", "bytes");
+  responseHeaders.set("Access-Control-Allow-Origin", "*");
+  responseHeaders.set("Cache-Control", "public, max-age=86400");
+
+  const cl = audioRes.headers.get("content-length");
+  if (cl) responseHeaders.set("Content-Length", cl);
+
+  const cr = audioRes.headers.get("content-range");
+  if (cr) responseHeaders.set("Content-Range", cr);
+
+  return new Response(audioRes.body, {
+    status: audioRes.status,
+    headers: responseHeaders,
+  });
 });
 
 // Aliases
