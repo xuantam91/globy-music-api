@@ -43,33 +43,16 @@ function createZingSig(path, params) {
   return hmac512(path + sha256("" + hashParam), Z_SECRET_KEY);
 }
 
-async function getZingCookie() {
+function getZingCookie() {
+  const vnIp = "14.225.204.77";
   const now = Date.now();
-  if (cachedZingCookie && now - zingCookieTimestamp < 10 * 60 * 1000) {
-    return cachedZingCookie;
-  }
-  try {
-    const res = await fetch(Z_BASE, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-    });
-    
-    // Thu thập toàn bộ cookie (đặc biệt là zmp3_rqid bắt buộc)
-    const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")];
-    const cookieStr = setCookies.filter(Boolean).map(c => c.split(";")[0]).join("; ");
-    if (cookieStr) {
-      cachedZingCookie = cookieStr;
-      zingCookieTimestamp = now;
-    }
-    return cachedZingCookie;
-  } catch {
-    return cachedZingCookie || "";
-  }
+  const rawRqid = `0|${vnIp}|v1.22.4|${now}`;
+  const rqid = Buffer.from(rawRqid).toString("base64");
+  return `zmp3_app_version.1=1224; zmp3_rqid=${rqid}`;
 }
 
 async function requestZing(apiPath, queryParams = {}) {
-  const cookie = await getZingCookie();
+  const cookie = getZingCookie();
   const ctime = Math.floor(Date.now() / 1000);
   const signedParams = { ...queryParams, ctime, version: Z_VERSION };
   const sig = createZingSig(apiPath, signedParams);
@@ -82,11 +65,15 @@ async function requestZing(apiPath, queryParams = {}) {
     sig,
   });
 
+  const vnIp = "14.225.204.77";
   const res = await fetch(`${Z_BASE}${apiPath}?${urlParams.toString()}`, {
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       Cookie: cookie,
       Referer: "https://zingmp3.vn/",
+      "X-Forwarded-For": vnIp,
+      "Client-IP": vnIp,
+      "X-Real-IP": vnIp,
     },
   });
 
@@ -117,16 +104,15 @@ async function getZingAudioUrl(songId) {
   try {
     const data = await requestZing("/api/v2/song/get/streaming", { id: songId });
     if (data.err === 0 && data.data) {
-      return (
-        data.data["128"] ||
-        (data.data.streaming && data.data.streaming["128"]) ||
-        `https://api.mp3.zing.vn/api/streaming/audio/${songId}/128`
-      );
+      const url = data.data["128"] || (data.data.streaming && data.data.streaming["128"]);
+      if (url && url !== "VIP" && url.startsWith("http")) {
+        return url;
+      }
     }
   } catch (err) {
     console.error("Zing audio error:", err);
   }
-  return `https://api.mp3.zing.vn/api/streaming/audio/${songId}/128`;
+  return null;
 }
 
 // ============================================================
@@ -157,10 +143,21 @@ async function getSoundCloudClientId() {
   return cachedSCClientId || "Me902VCqB1VmYOCc7W9v0XM17WgIHGSL";
 }
 
+const audioDirectCache = new Map();
+function setAudioCache(key, url) {
+  if (audioDirectCache.size > 500) audioDirectCache.clear();
+  audioDirectCache.set(key, { url, exp: Date.now() + 60 * 60 * 1000 });
+}
+function getAudioCache(key) {
+  const item = audioDirectCache.get(key);
+  if (item && item.exp > Date.now()) return item.url;
+  return null;
+}
+
 async function searchSoundCloud(query) {
   try {
     const clientId = await getSoundCloudClientId();
-    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=5`;
+    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=15`;
     const res = await fetch(searchUrl, {
       headers: { "User-Agent": "Mozilla/5.0" },
     });
@@ -345,15 +342,31 @@ app.get("/stream_pcm", async (c) => {
 
   let songResult = null;
 
-  // Nhận diện bài hát: Zing MP3 luôn là ưu tiên hàng đầu vì có link MP3 128kbps chuẩn
   if (forcedSource === "soundcloud") {
     songResult = await searchSoundCloud(q);
+    if (songResult) {
+      const directScUrl = await getSoundCloudAudioUrl(songResult.id);
+      if (directScUrl) setAudioCache(`sc_${songResult.id}`, directScUrl);
+    }
   } else {
-    // 1) Tìm kiếm trên Zing MP3 trước (Zing trả về chuẩn file MP3 audio/mpeg 100%)
-    songResult = await searchZingSong(q);
-    // 2) Nếu Zing MP3 không có bài -> Fallback sang SoundCloud (chỉ lấy track có Progressive MP3)
+    // 1) Thử tìm trên Zing MP3 trước
+    const zingCandidate = await searchZingSong(q);
+    if (zingCandidate) {
+      // Kiểm tra ngay xem bài hát này Zing có cho stream không (loại bỏ bài VIP hoặc bị giới hạn địa lý)
+      const directZingUrl = await getZingAudioUrl(zingCandidate.id);
+      if (directZingUrl) {
+        songResult = zingCandidate;
+        setAudioCache(`zing_${zingCandidate.id}`, directZingUrl);
+      }
+    }
+
+    // 2) Nếu Zing MP3 không có bài hoặc không stream được -> Fallback sang SoundCloud (Progressive MP3)
     if (!songResult) {
       songResult = await searchSoundCloud(q);
+      if (songResult) {
+        const directScUrl = await getSoundCloudAudioUrl(songResult.id);
+        if (directScUrl) setAudioCache(`sc_${songResult.id}`, directScUrl);
+      }
     }
   }
 
@@ -386,9 +399,9 @@ app.get("/proxy_audio", async (c) => {
     const radio = RADIOS[id] || RADIOS.vov1;
     directUrl = radio.streamUrl;
   } else if (source === "soundcloud") {
-    directUrl = await getSoundCloudAudioUrl(id);
+    directUrl = getAudioCache(`sc_${id}`) || (await getSoundCloudAudioUrl(id));
   } else {
-    directUrl = await getZingAudioUrl(id);
+    directUrl = getAudioCache(`zing_${id}`) || (await getZingAudioUrl(id));
   }
 
   if (!directUrl) return c.text("Audio stream not found", 404);
