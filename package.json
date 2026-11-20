@@ -1,0 +1,16 @@
+{
+  "name": "globy-music-cloudflare",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker Music & Radio API for ESP32 and XiaoZhi AI",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "wrangler": "^3.91.0"
+  }
+}
