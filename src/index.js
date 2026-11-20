@@ -413,7 +413,18 @@ app.get("/radio/play", (c) => {
 // Endpoint lyric trả rỗng để tương thích firmware
 app.get(["/proxy_lyric", "/dynamic_lyric"], (c) => c.text(""));
 
-// Healthcheck
+// Healthcheck & Debug
+app.get("/api/debug_zing", async (c) => {
+  const cookie = await getZingCookie();
+  const id = c.req.query("id") || "weGwKtI31kUd";
+  const data = await requestZing("/api/v2/song/get/streaming", { id });
+  return c.json({
+    cookieSample: cookie.substring(0, 50),
+    cookieLength: cookie.length,
+    zingResponse: data
+  });
+});
+
 app.get("/api/health", (c) => {
   return c.json({
     status: "ok",
