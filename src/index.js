@@ -80,26 +80,6 @@ async function requestZing(apiPath, queryParams = {}) {
   return await res.json();
 }
 
-async function searchZingSong(query) {
-  try {
-    const data = await requestZing("/api/v2/search/multi", { q: query });
-    if (data.err === 0 && data.data?.songs?.length > 0) {
-      const s = data.data.songs[0];
-      return {
-        id: s.encodeId, // ID ngắn 12 ký tự an toàn cho buffer ESP32
-        title: s.title || query,
-        artist: s.artistsNames || (s.artists && s.artists[0]?.name) || "Zing Artist",
-        thumbnail: s.thumbnailM || s.thumbnail || "",
-        duration: s.duration || 0,
-        source: "zing",
-      };
-    }
-  } catch (err) {
-    console.error("Zing search error:", err);
-  }
-  return null;
-}
-
 async function getZingAudioUrl(songId) {
   try {
     const data = await requestZing("/api/v2/song/get/streaming", { id: songId });
@@ -115,6 +95,39 @@ async function getZingAudioUrl(songId) {
   return null;
 }
 
+async function searchZingSong(query) {
+  try {
+    const data = await requestZing("/api/v2/search/multi", { q: query });
+    if (data.err === 0 && data.data?.songs?.length > 0) {
+      const songs = data.data.songs;
+      // Ưu tiên các bài không bị đánh dấu VIP (streamingStatus !== 2) trước,
+      // và kiểm tra tối đa 5 bài đầu tiên để tránh bỏ sót khi bài #1 là VIP
+      const nonVip = songs.filter(s => s?.encodeId && s.streamingStatus !== 2);
+      const vipFallback = songs.filter(s => s?.encodeId && s.streamingStatus === 2);
+      const candidates = [...nonVip, ...vipFallback].slice(0, 5);
+
+      for (const s of candidates) {
+        const directUrl = await getZingAudioUrl(s.encodeId);
+        if (directUrl) {
+          setAudioCache(`zing_${s.encodeId}`, directUrl);
+          return {
+            id: s.encodeId, // ID ngắn 12 ký tự an toàn cho buffer ESP32
+            title: s.title || query,
+            artist: s.artistsNames || (s.artists && s.artists[0]?.name) || "Zing Artist",
+            thumbnail: s.thumbnailM || s.thumbnail || "",
+            duration: s.duration || 0,
+            source: "zing",
+            directUrl,
+          };
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Zing search error:", err);
+  }
+  return null;
+}
+
 // ============================================================
 // 2. SOUNDCLOUD ENGINE (Chỉ lấy Progressive MP3 để tránh crash ESP32)
 // ============================================================
@@ -122,9 +135,9 @@ let cachedSCClientId = "Me902VCqB1VmYOCc7W9v0XM17WgIHGSL";
 let scClientTimestamp = 0;
 const scTranscodingCache = new Map();
 
-async function getSoundCloudClientId() {
+async function getSoundCloudClientId(forceRefresh = false) {
   const now = Date.now();
-  if (cachedSCClientId && now - scClientTimestamp < 24 * 60 * 60 * 1000) {
+  if (!forceRefresh && cachedSCClientId && now - scClientTimestamp < 24 * 60 * 60 * 1000) {
     return cachedSCClientId;
   }
   try {
@@ -151,37 +164,76 @@ function setAudioCache(key, url) {
 function getAudioCache(key) {
   const item = audioDirectCache.get(key);
   if (item && item.exp > Date.now()) return item.url;
+  audioDirectCache.delete(key);
   return null;
+}
+function deleteAudioCache(key) {
+  audioDirectCache.delete(key);
+}
+
+function findProgressiveMp3Transcoding(track) {
+  const list = track?.media?.transcodings;
+  if (!Array.isArray(list)) return null;
+  // QUAN TRỌNG: Chỉ nhận protocol === "progressive" (MP3 thuần),
+  // tuyệt đối không nhận protocol === "hls" (vì mime_type "audio/mpegurl" cũng chứa chữ "mpeg")
+  return (
+    list.find(t => t.format?.protocol === "progressive" && !t.snipped) ||
+    list.find(t => t.format?.protocol === "progressive") ||
+    null
+  );
 }
 
 async function searchSoundCloud(query) {
   try {
-    const clientId = await getSoundCloudClientId();
-    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=15`;
-    const res = await fetch(searchUrl, {
+    let clientId = await getSoundCloudClientId();
+    let searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=30`;
+    let res = await fetch(searchUrl, {
       headers: { "User-Agent": "Mozilla/5.0" },
     });
+    if (res.status === 401 || res.status === 403) {
+      clientId = await getSoundCloudClientId(true);
+      searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=30`;
+      res = await fetch(searchUrl, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+    }
     if (!res.ok) return null;
 
     const data = await res.json();
-    for (const track of data.collection || []) {
-      // QUAN TRỌNG: XiaoZhi ESP32 chỉ decode được MP3 thuần (progressive)
-      // KHÔNG ĐƯỢC trả về HLS (m3u8) vì decoder ESP32 sẽ bị tràn stack (assert crash)
-      const trans = track.media?.transcodings?.find(
-        t => t.format?.protocol === "progressive" || t.format?.mime_type?.includes("mpeg")
-      );
+    const collection = data.collection || [];
 
-      if (trans) {
-        const trackIdStr = String(track.id);
-        scTranscodingCache.set(trackIdStr, trans.url);
+    // Ưu tiên bản progressive full (!snipped) trước, sau đó mới tới bản progressive preview
+    const fullCandidates = [];
+    const snippedCandidates = [];
+    for (const track of collection) {
+      const trans = findProgressiveMp3Transcoding(track);
+      if (!trans) continue;
+      if (!trans.snipped) {
+        fullCandidates.push({ track, trans });
+      } else {
+        snippedCandidates.push({ track, trans });
+      }
+    }
 
+    const candidates = [...fullCandidates, ...snippedCandidates].slice(0, 5);
+    for (const { track, trans } of candidates) {
+      const trackIdStr = String(track.id);
+      scTranscodingCache.set(trackIdStr, {
+        url: trans.url,
+        trackAuth: track.track_authorization || "",
+      });
+
+      const directUrl = await getSoundCloudAudioUrl(trackIdStr);
+      if (directUrl) {
+        setAudioCache(`sc_${trackIdStr}`, directUrl);
         return {
           id: trackIdStr, // Dùng ID ngắn (chữ số) để tránh tràn URL buffer của ESP32
-          title: track.title,
+          title: track.title || query,
           artist: track.user?.username || "SoundCloud Artist",
           thumbnail: track.artwork_url || track.user?.avatar_url || "",
-          duration: Math.floor((track.duration || 0) / 1000),
+          duration: Math.floor(((trans.duration || track.duration || 0)) / 1000),
           source: "soundcloud",
+          directUrl,
         };
       }
     }
@@ -194,7 +246,9 @@ async function searchSoundCloud(query) {
 async function getSoundCloudAudioUrl(trackId) {
   try {
     const clientId = await getSoundCloudClientId();
-    let transUrl = scTranscodingCache.get(String(trackId));
+    let cachedTrans = scTranscodingCache.get(String(trackId));
+    let transUrl = typeof cachedTrans === "string" ? cachedTrans : cachedTrans?.url;
+    let trackAuth = typeof cachedTrans === "object" ? cachedTrans?.trackAuth : "";
 
     if (!transUrl) {
       // Nếu chưa có trong cache thì tra cứu lại track
@@ -203,20 +257,26 @@ async function getSoundCloudAudioUrl(trackId) {
       });
       if (trackRes.ok) {
         const track = await trackRes.json();
-        const trans = track.media?.transcodings?.find(
-          t => t.format?.protocol === "progressive" || t.format?.mime_type?.includes("mpeg")
-        );
-        if (trans) transUrl = trans.url;
+        const trans = findProgressiveMp3Transcoding(track);
+        if (trans) {
+          transUrl = trans.url;
+          trackAuth = track.track_authorization || "";
+          scTranscodingCache.set(String(trackId), { url: transUrl, trackAuth });
+        }
       }
     }
 
     if (transUrl) {
-      const res = await fetch(`${transUrl}?client_id=${clientId}`, {
+      const sep = transUrl.includes("?") ? "&" : "?";
+      const authParam = trackAuth ? `&track_authorization=${encodeURIComponent(trackAuth)}` : "";
+      const res = await fetch(`${transUrl}${sep}client_id=${clientId}${authParam}`, {
         headers: { "User-Agent": "Mozilla/5.0" },
       });
       if (res.ok) {
         const data = await res.json();
-        return data.url;
+        if (data?.url && data.url.startsWith("http")) {
+          return data.url;
+        }
       }
     }
   } catch (err) {
@@ -226,21 +286,21 @@ async function getSoundCloudAudioUrl(trackId) {
 }
 
 // ============================================================
-// 3. RADIO VOV
+// 3. RADIO VOV (100% Luồng HTTP MP3 audio/mpeg trực tiếp cho ESP32)
 // ============================================================
 const RADIOS = {
   vov1: {
     key: "vov1",
     name: "VOV1 - Thời sự",
     aliases: ["vov1", "vov 1", "vov-1", "thoi su", "tin tuc"],
-    streamUrl: "http://media.kythuatvov.vn:7001/;stream/",
+    streamUrl: "http://media.kythuatvov.vn:7003/;stream/",
     thumb: "https://vov.vn/themes/custom/vov/logo.svg",
   },
   vov2: {
     key: "vov2",
     name: "VOV2 - Văn hóa Xã hội",
     aliases: ["vov2", "vov 2", "vov-2", "van hoa"],
-    streamUrl: "http://media.kythuatvov.vn:7003/;stream/",
+    streamUrl: "http://media.kythuatvov.vn:7005/;stream/",
     thumb: "https://vov.vn/themes/custom/vov/logo.svg",
   },
   vov3: {
@@ -254,21 +314,21 @@ const RADIOS = {
     key: "vov5",
     name: "VOV5 - Phát thanh Đối ngoại",
     aliases: ["vov5", "vov 5", "vov-5", "doi ngoai"],
-    streamUrl: "https://str.vov.gov.vn/vovlive/vov5.sdp_aac/playlist.m3u8",
+    streamUrl: "http://media.kythuatvov.vn:7059/;stream/",
     thumb: "https://vov.vn/themes/custom/vov/logo.svg",
   },
   "vov-gt": {
     key: "vov-gt",
     name: "VOV Giao Thông Hà Nội",
     aliases: ["vov giao thong", "vovgt", "giao thong ha noi", "giao thong hn", "vov-gt"],
-    streamUrl: "https://str.vov.gov.vn/vovlive/vovgt-hn.sdp_aac/playlist.m3u8",
+    streamUrl: "http://media.kythuatvov.vn:7025/;stream/",
     thumb: "https://vov.vn/themes/custom/vov/logo.svg",
   },
   "vov-gt-hcm": {
     key: "vov-gt-hcm",
     name: "VOV Giao Thông TP.HCM",
     aliases: ["vov giao thong hcm", "vovgt hcm", "giao thong sai gon", "giao thong hcm", "vov-gt-hcm"],
-    streamUrl: "https://str.vov.gov.vn/vovlive/vovgt-hcm.sdp_aac/playlist.m3u8",
+    streamUrl: "http://media.kythuatvov.vn:7045/;stream/",
     thumb: "https://vov.vn/themes/custom/vov/logo.svg",
   },
 };
@@ -344,29 +404,13 @@ app.get("/stream_pcm", async (c) => {
 
   if (forcedSource === "soundcloud") {
     songResult = await searchSoundCloud(q);
-    if (songResult) {
-      const directScUrl = await getSoundCloudAudioUrl(songResult.id);
-      if (directScUrl) setAudioCache(`sc_${songResult.id}`, directScUrl);
-    }
   } else {
-    // 1) Thử tìm trên Zing MP3 trước
-    const zingCandidate = await searchZingSong(q);
-    if (zingCandidate) {
-      // Kiểm tra ngay xem bài hát này Zing có cho stream không (loại bỏ bài VIP hoặc bị giới hạn địa lý)
-      const directZingUrl = await getZingAudioUrl(zingCandidate.id);
-      if (directZingUrl) {
-        songResult = zingCandidate;
-        setAudioCache(`zing_${zingCandidate.id}`, directZingUrl);
-      }
-    }
+    // 1) Thử tìm trên Zing MP3 trước (đã tự động lọc VIP & kiểm tra top 5 bài hát có luồng 128kbps)
+    songResult = await searchZingSong(q);
 
     // 2) Nếu Zing MP3 không có bài hoặc không stream được -> Fallback sang SoundCloud (Progressive MP3)
     if (!songResult) {
       songResult = await searchSoundCloud(q);
-      if (songResult) {
-        const directScUrl = await getSoundCloudAudioUrl(songResult.id);
-        if (directScUrl) setAudioCache(`sc_${songResult.id}`, directScUrl);
-      }
     }
   }
 
@@ -375,6 +419,7 @@ app.get("/stream_pcm", async (c) => {
       title: songResult.title,
       artist: songResult.artist,
       // URL ngắn gọn, chỉ truyền id ngắn (không quá 15 ký tự) tránh tràn buffer ESP32
+      // Không trả về lyric_url để ESP32 bỏ qua bước tải lyrics
       audio_url: `/proxy_audio?id=${songResult.id}&source=${songResult.source}`,
       thumbnail: songResult.thumbnail,
       duration: songResult.duration,
@@ -385,45 +430,86 @@ app.get("/stream_pcm", async (c) => {
   return c.json({ error: "Not found", message: `Không tìm thấy bài hát: ${q}` }, 404);
 });
 
-// 4.2) /proxy_audio?id=...&source=...
-// STREAM TRỰC TIẾP LUỒNG MP3 (HTTP 200/206) VỀ ESP32
-// KHÔNG dùng 302 redirect vì HttpClient trên ESP32 XiaoZhi không hỗ trợ follow redirect
-app.get("/proxy_audio", async (c) => {
-  const id = c.req.query("id");
-  const source = c.req.query("source") || "zing";
-
+// 4.2) Hàm dùng chung để stream trực tiếp luồng MP3 (HTTP 200/206) về ESP32
+// KHÔNG dùng 302 redirect vì HttpClient trên ESP32 không hỗ trợ follow redirect
+async function streamAudioResponse(c, id, source = "zing") {
   if (!id) return c.text("Missing id", 400);
 
-  let directUrl = "";
+  const isRadio = source === "radio" || Boolean(RADIOS[id]);
+  const cacheKey = source === "soundcloud" ? `sc_${id}` : `zing_${id}`;
 
-  if (source === "radio" || RADIOS[id]) {
-    const radio = RADIOS[id] || RADIOS.vov1;
-    directUrl = radio.streamUrl;
-  } else if (source === "soundcloud") {
-    directUrl = getAudioCache(`sc_${id}`) || (await getSoundCloudAudioUrl(id));
+  const resolveFreshUrl = async () => {
+    if (isRadio) {
+      const radio = RADIOS[id] || RADIOS.vov1;
+      return radio.streamUrl;
+    }
+    const fresh =
+      source === "soundcloud" ? await getSoundCloudAudioUrl(id) : await getZingAudioUrl(id);
+    if (fresh) setAudioCache(cacheKey, fresh);
+    return fresh;
+  };
+
+  let usedCachedUrl = false;
+  let directUrl = "";
+  if (isRadio) {
+    directUrl = await resolveFreshUrl();
   } else {
-    directUrl = getAudioCache(`zing_${id}`) || (await getZingAudioUrl(id));
+    const cached = getAudioCache(cacheKey);
+    if (cached) {
+      directUrl = cached;
+      usedCachedUrl = true;
+    } else {
+      directUrl = await resolveFreshUrl();
+    }
   }
 
   if (!directUrl) return c.text("Audio stream not found", 404);
 
-  // Pipe luồng âm thanh trực tiếp từ CDN về thiết bị
   const rangeHeader = c.req.header("range");
-  const fetchHeaders = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    Referer: "https://zingmp3.vn/",
+  const buildFetchHeaders = () => {
+    const h = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    };
+    if (source === "zing" && !isRadio) {
+      h["Referer"] = "https://zingmp3.vn/";
+    }
+    if (rangeHeader && !isRadio) {
+      h["Range"] = rangeHeader;
+    }
+    return h;
   };
-  if (rangeHeader) {
-    fetchHeaders["Range"] = rangeHeader;
+
+  let audioRes = await fetch(directUrl, {
+    headers: buildFetchHeaders(),
+    redirect: "follow",
+  });
+
+  // Nếu URL trong cache bị hết hạn (403/404/5xx), xóa cache và lấy lại URL mới 1 lần
+  if (!audioRes.ok && usedCachedUrl && !isRadio) {
+    deleteAudioCache(cacheKey);
+    const freshUrl = await resolveFreshUrl();
+    if (freshUrl) {
+      directUrl = freshUrl;
+      audioRes = await fetch(directUrl, {
+        headers: buildFetchHeaders(),
+        redirect: "follow",
+      });
+    }
   }
 
-  const audioRes = await fetch(directUrl, { headers: fetchHeaders });
-  
+  if (!audioRes.ok && audioRes.status !== 206) {
+    return c.text(`Upstream audio error (${audioRes.status})`, 502);
+  }
+
   const responseHeaders = new Headers();
   responseHeaders.set("Content-Type", "audio/mpeg");
-  responseHeaders.set("Accept-Ranges", "bytes");
+  responseHeaders.set("Accept-Ranges", isRadio ? "none" : "bytes");
   responseHeaders.set("Access-Control-Allow-Origin", "*");
-  responseHeaders.set("Cache-Control", "public, max-age=86400");
+  responseHeaders.set(
+    "Cache-Control",
+    isRadio ? "no-cache, no-store, must-revalidate" : "public, max-age=86400"
+  );
 
   const cl = audioRes.headers.get("content-length");
   if (cl) responseHeaders.set("Content-Length", cl);
@@ -432,21 +518,27 @@ app.get("/proxy_audio", async (c) => {
   if (cr) responseHeaders.set("Content-Range", cr);
 
   return new Response(audioRes.body, {
-    status: audioRes.status,
+    status: audioRes.status === 206 ? 206 : 200,
     headers: responseHeaders,
   });
+}
+
+app.get("/proxy_audio", async (c) => {
+  const id = c.req.query("id");
+  const source = c.req.query("source") || c.req.query("type") || "zing";
+  return streamAudioResponse(c, id, source);
 });
 
-// Aliases
-app.get("/audio/:id", (c) => {
+// Aliases: stream trực tiếp (200/206) thay vì trả về 302 redirect
+app.get("/audio/:id", async (c) => {
   const id = c.req.param("id");
-  const source = c.req.query("source") || "zing";
-  return c.redirect(`/proxy_audio?id=${encodeURIComponent(id)}&source=${source}`, 302);
+  const source = c.req.query("source") || c.req.query("type") || "zing";
+  return streamAudioResponse(c, id, source);
 });
 
-app.get("/radio/play", (c) => {
+app.get("/radio/play", async (c) => {
   const id = c.req.query("id") || "vov1";
-  return c.redirect(`/proxy_audio?id=${encodeURIComponent(id)}&source=radio`, 302);
+  return streamAudioResponse(c, id, "radio");
 });
 
 // Endpoint lyric trả rỗng để tương thích firmware
@@ -468,8 +560,9 @@ app.get("/api/health", (c) => {
   return c.json({
     status: "ok",
     platform: "Cloudflare Workers (Edge)",
-    engine: "Globy Music Engine v2.1 (MP3 Pure for ESP32 XiaoZhi)",
+    engine: "Globy Music Engine v2.2 (MP3 Pure for ESP32 XiaoZhi)",
     sources: ["zing", "soundcloud", "radio"],
+    radios: Object.keys(RADIOS),
     timestamp: new Date().toISOString(),
   });
 });
